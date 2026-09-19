@@ -15,13 +15,30 @@ export interface QueryPlan {
   children: QueryPlan[]
   index?: string
   filter?: string
+  joinType?: string
+  invalid?: boolean
+}
+
+export interface ParsedJoin {
+  type: string
+  table: string
+  alias?: string
+  condition: string
+  from?: string
+  valid: boolean
+}
+
+export interface ParseError {
+  segment: string
+  message: string
 }
 
 export interface ParsedQuery {
   type: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE' | 'UNKNOWN'
   tables: string[]
   columns: string[]
-  joins: { type: string; table: string; condition: string }[]
+  joins: ParsedJoin[]
+  errors: ParseError[]
   whereConditions: string[]
   orderBy: string[]
   groupBy: string[]
@@ -53,44 +70,274 @@ const SCHEMA: SQLTable[] = [
   ]},
 ]
 
+const IDENT = '[`"]?[a-zA-Z_]\\w*[`"]?'
+const TERMINATOR_RE = /\b(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|UNION|RETURNING)\b/i
+const JOIN_RE = /(NATURAL\s+)?(?:(LEFT|RIGHT|FULL)(?:\s+OUTER)?|INNER|OUTER|CROSS)?\s+JOIN\b/gi
+
+/** 屏蔽字符串字面量与注释，保证关键字识别只在真实 SQL 代码上进行（位置保持不变） */
+function maskLiterals(sql: string): string {
+  return sql.replace(/'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|--[^\n]*|\/\*[\s\S]*?\*\//g, m => ' '.repeat(m.length))
+}
+
+/** 计算每个位置的括号深度（深度 > 0 即位于子查询内） */
+function depthAt(sql: string, index: number): number {
+  let depth = 0
+  for (let i = 0; i < index; i++) {
+    if (sql[i] === '(') depth++
+    else if (sql[i] === ')') depth = Math.max(0, depth - 1)
+  }
+  return depth
+}
+
+function unquote(name: string): string {
+  return name.replace(/[`"]/g, '').toLowerCase()
+}
+
+function truncate(s: string, n = 40): string {
+  const t = s.trim().replace(/\s+/g, ' ')
+  return t.length > n ? t.slice(0, n) + '…' : t
+}
+
+interface TableRef { name: string; alias?: string }
+
+/** 解析 FROM 之后、终止关键字之前的顶层表引用链（含全部 JOIN）。orig 与 masked 等长，按同一偏移取文本 */
+function parseTableChain(orig: string, masked: string, schemaNames: string[], errors: ParseError[]): { base?: TableRef; joins: ParsedJoin[]; hasCommaJoin: boolean } {
+  const joins: ParsedJoin[] = []
+  let hasCommaJoin = false
+
+  const firstKw = masked.search(TERMINATOR_RE)
+  const end = firstKw >= 0 ? firstKw : masked.length
+  const chain = masked.slice(0, end)
+  const origChain = orig.slice(0, end)
+  if (!chain.trim()) return { joins, hasCommaJoin }
+
+  // 顶层逗号分隔：FROM a, b —— 隐式交叉连接
+  const commaParts = chain.split(',').map(s => s.trim()).filter(Boolean)
+  const head = commaParts.shift()!
+  if (commaParts.length) hasCommaJoin = true
+
+  const RESERVED = /^(ON|USING|WHERE|GROUP|HAVING|ORDER|LIMIT|UNION|JOIN|LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)$/i
+  const readRef = (text: string, pos: number): { ref?: TableRef; next: number } => {
+    const m = text.slice(pos).match(new RegExp(`^\\s*(?:${IDENT}\\s*\\.\\s*)?(${IDENT})`))
+    if (!m) return { next: pos }
+    const rawName = m[1]
+    // ON / USING 等关键字紧跟 JOIN，说明缺失表名
+    if (/^(ON|USING)$/i.test(rawName)) return { next: pos }
+    const name = unquote(rawName)
+    let next = pos + m[0].length
+    let alias: string | undefined
+    const aliasM = text.slice(next).match(new RegExp(`^\\s+(?:AS\\s+)?(${IDENT})\\b`))
+    if (aliasM && !RESERVED.test(aliasM[1])) {
+      alias = unquote(aliasM[1])
+      next += aliasM[0].length
+    }
+    return { ref: { name, alias }, next }
+  }
+
+  const headParsed = readRef(chain, 0)
+  let prev: TableRef | undefined = headParsed.ref
+  if (prev && !schemaNames.includes(prev.name)) {
+    errors.push({ segment: `FROM ${prev.name}`, message: `FROM 子句中的表 "${prev.name}" 在当前 Schema 中不存在` })
+  }
+  for (const part of commaParts) {
+    const { ref } = readRef(part, 0)
+    if (!ref) continue
+    if (!schemaNames.includes(ref.name)) {
+      errors.push({ segment: `FROM …, ${ref.name}`, message: `逗号连接的表 "${ref.name}" 在当前 Schema 中不存在` })
+    }
+    joins.push({ type: 'CROSS JOIN', table: ref.name, alias: ref.alias, condition: '', from: prev?.name, valid: schemaNames.includes(ref.name) })
+    prev = ref
+  }
+
+  const joinTypeLabel = (jm: RegExpExecArray): string => {
+    if (jm[2]) return (jm[1] ? 'NATURAL ' : '') + jm[2].toUpperCase() + ' JOIN'
+    if (/CROSS/i.test(jm[0])) return 'CROSS JOIN'
+    const word = jm[0].replace(/\s*JOIN\s*$/i, '').replace(/NATURAL/i, '').trim().toUpperCase()
+    return (jm[1] ? 'NATURAL ' : '') + (word || 'INNER') + ' JOIN'
+  }
+
+  JOIN_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = JOIN_RE.exec(chain))) {
+    const afterJoin = JOIN_RE.lastIndex
+    const { ref, next } = readRef(chain, afterJoin)
+    const rawSegment = origChain.slice(m.index, next)
+
+    if (!ref) {
+      errors.push({ segment: truncate(rawSegment || m[0]), message: 'JOIN 后缺少被连接的表名' })
+      JOIN_RE.lastIndex = afterJoin
+      continue
+    }
+
+    const type = joinTypeLabel(m)
+    const tail = chain.slice(next)
+    const usingM = tail.match(/^\s+USING\s*\(\s*([^)]*?)\s*\)/i)
+    // ON 后必须有实际条件；USING 子句不能被 ON 懒匹配吞掉
+    const onM = usingM ? null : tail.match(/^\s+ON\s+([\s\S]*?)(?=\s+(?:NATURAL\s+)?(?:(?:LEFT|RIGHT|FULL)(?:\s+OUTER)?|INNER|OUTER|CROSS)?\s*JOIN\b|\s*$)/i)
+
+    let condition = ''
+    let valid = schemaNames.includes(ref.name)
+
+    if (usingM) {
+      condition = `USING (${usingM[1].trim()})`
+    } else if (/CROSS/i.test(m[0]) && !(onM && onM[1].trim())) {
+      condition = ''
+    } else if (!onM || !onM[1].trim()) {
+      valid = false
+      errors.push({ segment: truncate(rawSegment), message: `${type} "${ref.name}" 缺少 ON 连接条件` })
+    } else {
+      const condStart = next + onM.index! + onM[0].lastIndexOf(onM[1])
+      condition = origChain.slice(condStart, condStart + onM[1].length).trim().replace(/\s+/g, ' ')
+    }
+
+    if (!schemaNames.includes(ref.name)) {
+      errors.push({ segment: truncate(rawSegment), message: `${type} 指向的表 "${ref.name}" 在当前 Schema 中不存在` })
+    }
+
+    joins.push({ type, table: ref.name, alias: ref.alias, condition, from: prev?.name, valid })
+    prev = ref
+    JOIN_RE.lastIndex = next
+  }
+
+  return { base: headParsed.ref, joins, hasCommaJoin }
+}
+
+function splitConditions(clause: string): string[] {
+  const parts: string[] = []
+  let depth = 0, start = 0
+  for (let i = 0; i < clause.length; i++) {
+    if (clause[i] === '(') depth++
+    else if (clause[i] === ')') depth = Math.max(0, depth - 1)
+    else if (depth === 0) {
+      const kw = clause[i] === 'A' ? 'AND' : clause[i] === 'O' ? 'OR' : null
+      if (kw && /\s$/.test(clause[i - 1] || ' ') && new RegExp(`^${kw}\\s`, 'i').test(clause.slice(i))) {
+        parts.push(clause.slice(start, i).trim())
+        start = i + kw.length
+        i += kw.length - 1
+      }
+    }
+  }
+  const tail = clause.slice(start).trim().replace(/;+\s*$/, '').trim()
+  if (tail) parts.push(tail)
+  return parts.filter(Boolean)
+}
+
 function parseSQL(sql: string): ParsedQuery {
-  const up = sql.toUpperCase().trim()
+  const masked = maskLiterals(sql)
+  const up = masked.toUpperCase().trim()
   const type = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE'].find(t => up.startsWith(t)) as ParsedQuery['type'] || 'UNKNOWN'
-  const tables = Array.from(sql.matchAll(/(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_]\w*)/gi)).map(m => m[1].toLowerCase())
-  const columns = type === 'SELECT' ? Array.from(sql.matchAll(/SELECT\s+([\s\S]*?)\s+FROM/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || [] : []
-  const joins = Array.from(sql.matchAll(/(LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN\s+([a-zA-Z_]\w*)\s+ON\s+([^JOIN|WHERE|GROUP|ORDER|LIMIT]+)/gi)).map(m => ({ type: (m[1] || 'INNER').trim(), table: m[2], condition: m[3].trim() }))
-  const whereMatch = sql.match(/WHERE\s+([\s\S]*?)(?:GROUP|ORDER|LIMIT|$)/i)
-  const whereConditions = whereMatch ? whereMatch[1].split(/\s+AND\s+|\s+OR\s+/i).map(s => s.trim()).filter(Boolean) : []
+
+  const errors: ParseError[] = []
+  const schemaNames = SCHEMA.map(s => s.name)
+
+  // 仅提取顶层 FROM（深度 0），子查询内的表不计入外层表与连接
+  let baseTable: TableRef | undefined
+  let joins: ParsedJoin[] = []
+  let hasCommaJoin = false
+  const fromM = masked.match(/\bFROM\b/i)
+  if (fromM && depthAt(masked, fromM.index!) === 0) {
+    const bodyOrig = sql.slice(fromM.index! + 4)
+    const bodyMasked = masked.slice(fromM.index! + 4)
+    const chain = parseTableChain(bodyOrig, bodyMasked, schemaNames, errors)
+    baseTable = chain.base
+    joins = chain.joins
+    hasCommaJoin = chain.hasCommaJoin
+  }
+  // UPDATE/INSERT ... INTO 的目标表
+  if (!baseTable) {
+    const targetM = masked.match(/\b(?:UPDATE|INTO)\s+([a-zA-Z_]\w*)/i)
+    if (targetM && depthAt(masked, targetM.index!) === 0) {
+      const name = targetM[1].toLowerCase()
+      baseTable = { name }
+      if (!schemaNames.includes(name)) {
+        errors.push({ segment: truncate(targetM[0]), message: `目标表 "${name}" 在当前 Schema 中不存在` })
+      }
+    }
+  }
+
+  const tables = baseTable ? [baseTable.name, ...joins.map(j => j.table)] : []
+
+  const columns = type === 'SELECT'
+    ? Array.from(sql.matchAll(/SELECT\s+([\s\S]*?)\s+FROM/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || []
+    : []
+  const whereMatch = sql.match(/WHERE\s+([\s\S]*?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s+LIMIT|\s*$)/i)
+  const whereConditions = whereMatch ? splitConditions(whereMatch[1]) : []
   const orderBy = Array.from(sql.matchAll(/ORDER\s+BY\s+([\s\S]*?)(?:LIMIT|$)/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || []
   const groupBy = Array.from(sql.matchAll(/GROUP\s+BY\s+([\s\S]*?)(?:HAVING|ORDER|LIMIT|$)/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || []
   const limitMatch = sql.match(/LIMIT\s+(\d+)/i)
   const limit = limitMatch ? parseInt(limitMatch[1]) : undefined
 
-  const complexity = tables.length + joins.length * 2 + whereConditions.length + orderBy.length + (sql.includes('DISTINCT') ? 3 : 0) + (sql.includes('HAVING') ? 2 : 0)
+  const badJoins = joins.filter(j => !j.valid).length
+  const complexity = tables.length + joins.length * 2 + whereConditions.length + orderBy.length
+    + (masked.toUpperCase().includes('DISTINCT') ? 3 : 0) + (masked.toUpperCase().includes('HAVING') ? 2 : 0)
+    + badJoins * 2
   const estimatedCost = tables.reduce((sum, t) => { const tbl = SCHEMA.find(s => s.name === t); return sum + (tbl?.rowCount || 1000) }, 0) * (joins.length + 1) / (limit || 100)
 
   const suggestions: string[] = []
-  if (joins.length > 3) suggestions.push('连接表过多（>3），考虑分解查询')
-  if (!whereConditions.length && type === 'SELECT') suggestions.push('无 WHERE 条件，将扫描全表')
+  if (joins.length > 3) suggestions.push(`连接表过多（${joins.length} 个 JOIN，>3），考虑分解查询`)
+  if (hasCommaJoin) suggestions.push('检测到逗号隐式连接，建议改写为显式 JOIN ... ON 并补充连接条件')
+  if (joins.some(j => j.condition && !j.condition.startsWith('USING') && !/(?<![<>!])=(?!=)/.test(j.condition))) {
+    suggestions.push('存在非等值连接条件，可能无法使用索引且结果集膨胀')
+  }
+  if (!whereConditions.length && type === 'SELECT' && tables.length) suggestions.push('无 WHERE 条件，将扫描全表')
   if (sql.includes('SELECT *')) suggestions.push('避免 SELECT *，明确指定列名')
   if (sql.toUpperCase().includes("LIKE '%")) suggestions.push("前缀通配符 LIKE '%...' 无法使用索引")
-  if (!limit && type === 'SELECT') suggestions.push('建议添加 LIMIT 限制结果集大小')
+  if (!limit && type === 'SELECT' && tables.length) suggestions.push('建议添加 LIMIT 限制结果集大小')
 
-  return { type, tables, columns, joins, whereConditions, orderBy, groupBy, limit, complexity, suggestions, estimatedCost: Math.round(estimatedCost) }
+  return { type, tables, columns, joins, errors, whereConditions, orderBy, groupBy, limit, complexity, suggestions, estimatedCost: Math.round(estimatedCost) }
+}
+
+function scanNode(table: string, parsed: ParsedQuery): QueryPlan {
+  const tbl = SCHEMA.find(s => s.name === table)
+  const known = !!tbl
+  const rowCount = tbl?.rowCount || 1000
+  const useIndex = parsed.whereConditions.length > 0
+  return {
+    operation: useIndex ? 'Index Scan' : 'Seq Scan',
+    table,
+    cost: rowCount * 0.01,
+    rows: Math.round(rowCount * (useIndex ? 0.1 : 1)),
+    children: [],
+    index: useIndex ? 'idx_' + table + '_id' : undefined,
+    invalid: !known,
+  }
 }
 
 function buildPlan(parsed: ParsedQuery): QueryPlan {
   if (parsed.tables.length === 0) return { operation: 'EMPTY', cost: 0, rows: 0, children: [] }
-  const tableScans: QueryPlan[] = parsed.tables.map(t => {
-    const tbl = SCHEMA.find(s => s.name === t)
-    return { operation: parsed.whereConditions.length > 0 ? 'Index Scan' : 'Seq Scan', table: t, cost: (tbl?.rowCount || 1000) * 0.01, rows: Math.round((tbl?.rowCount || 1000) * (parsed.whereConditions.length > 0 ? 0.1 : 1)), children: [], index: parsed.whereConditions.length > 0 ? 'idx_' + t + '_id' : undefined }
-  })
-  if (tableScans.length === 1) {
-    const root: QueryPlan = { operation: 'Sort', cost: tableScans[0].cost * 1.2, rows: tableScans[0].rows, children: [tableScans[0]] }
-    return root
+
+  const baseTable = parsed.tables[0]
+  let root: QueryPlan = scanNode(baseTable, parsed)
+
+  // 单表语句保持原有的 Sort → Scan 两层结构
+  if (parsed.joins.length === 0) {
+    return { operation: 'Sort', cost: root.cost * 1.2, rows: root.rows, children: [root], invalid: root.invalid }
   }
-  const join: QueryPlan = { operation: 'Hash Join', cost: tableScans.reduce((s, n) => s + n.cost, 0) * 1.5, rows: Math.round(tableScans[0].rows * 0.5), children: tableScans, filter: parsed.joins[0]?.condition }
-  return { operation: parsed.orderBy.length ? 'Sort' : 'Result', cost: join.cost * 1.1, rows: join.rows, children: [join] }
+
+  // 严格按解析出的连接链逐层嵌套连接节点
+  parsed.joins.forEach(j => {
+    const right = scanNode(j.table, parsed)
+    const isCross = /CROSS/i.test(j.type)
+    const joinOp = isCross ? 'Nested Loop Join' : 'Hash Join'
+    const joinNode: QueryPlan = {
+      operation: joinOp,
+      cost: (root.cost + right.cost) * 1.5,
+      rows: isCross ? root.rows * right.rows : Math.round(root.rows * 0.5),
+      children: [root, right],
+      joinType: j.type,
+      filter: j.condition || undefined,
+      invalid: !j.valid,
+    }
+    root = joinNode
+  })
+
+  const top: QueryPlan = {
+    operation: parsed.orderBy.length ? 'Sort' : 'Result',
+    cost: root.cost * 1.1,
+    rows: root.rows,
+    children: [root],
+  }
+  return top
 }
 
 export const SQL_TEMPLATES = [

@@ -47,13 +47,33 @@
             <div class="bg-slate-900 rounded p-2 text-center"><div class="text-xs text-slate-500 mb-1">JOIN数</div><div class="text-orange-400 font-bold">{{ store.parsed.joins.length }}</div></div>
             <div class="bg-slate-900 rounded p-2 text-center"><div class="text-xs text-slate-500 mb-1">预估行数</div><div class="text-purple-400 font-bold">{{ store.parsed.estimatedCost }}</div></div>
           </div>
+          <div v-if="store.parsed.joins.length" class="mb-3">
+            <div class="text-xs text-slate-500 mb-1">连接明细（{{ store.parsed.joins.length }}）</div>
+            <div class="space-y-1">
+              <div v-for="(j, i) in store.parsed.joins" :key="i"
+                :class="['text-xs font-mono rounded border p-2', j.valid ? 'bg-slate-900 border-slate-700 text-slate-300' : 'bg-red-900/30 border-red-700 text-red-300']">
+                <span class="font-bold text-orange-400">{{ j.type }}</span>
+                <span class="text-slate-400"> {{ j.from || '?' }} → </span>
+                <span :class="j.valid ? 'text-cyan-400 font-bold' : 'text-red-400 font-bold'">{{ j.table }}</span><span v-if="j.alias" class="text-slate-500"> AS {{ j.alias }}</span>
+                <span v-if="j.condition" class="text-pink-300"> ON {{ j.condition }}</span>
+                <span v-else class="text-red-400"> ⚠ 缺少 ON 连接条件</span>
+              </div>
+            </div>
+          </div>
+          <div v-if="store.parsed.errors.length" class="space-y-1 mb-3">
+            <div class="text-xs text-red-500 mb-1">解析错误（不按单表静默处理）</div>
+            <div v-for="(e, i) in store.parsed.errors" :key="i" class="text-xs flex items-start gap-2 bg-red-900/30 border border-red-700 rounded p-2">
+              <span class="text-red-400">✗</span>
+              <span><span class="text-red-300 font-bold">{{ e.message }}</span><span class="text-slate-400"> —— 出错片段：</span><code class="text-red-300">{{ e.segment }}</code></span>
+            </div>
+          </div>
           <div v-if="store.parsed.suggestions.length" class="space-y-1">
             <div class="text-xs text-slate-500 mb-1">优化建议</div>
             <div v-for="(s, i) in store.parsed.suggestions" :key="i" class="text-xs flex items-start gap-2 bg-orange-900/30 border border-orange-700 rounded p-2">
               <span class="text-orange-400">⚠</span><span class="text-orange-300">{{ s }}</span>
             </div>
           </div>
-          <div v-else class="text-xs text-green-400 bg-green-900/20 border border-green-700 rounded p-2">✓ 未发现明显性能问题</div>
+          <div v-else-if="!store.parsed.errors.length" class="text-xs text-green-400 bg-green-900/20 border border-green-700 rounded p-2">✓ 未发现明显性能问题</div>
         </div>
         <div v-if="store.plan" class="bg-slate-800 rounded-lg p-4 border border-slate-700">
           <h3 class="text-sm font-bold text-slate-400 mb-3">执行计划树</h3>
@@ -86,14 +106,19 @@ const PlanNode = defineComponent({
       if (!props.node) return null
       const n = props.node as any
       const indent = '  '.repeat(props.depth || 0)
-      const opColor = n.operation.includes('Scan') ? '#22c55e' : n.operation.includes('Join') ? '#f97316' : n.operation.includes('Sort') ? '#8b5cf6' : '#06b6d4'
+      const opColor = n.invalid ? '#ef4444'
+        : n.operation.includes('Scan') ? '#22c55e'
+        : n.operation.includes('Join') ? '#f97316'
+        : n.operation.includes('Sort') ? '#8b5cf6' : '#06b6d4'
       return h('div', [
         h('div', { style: `padding-left: ${(props.depth || 0) * 20}px` }, [
           h('span', { style: 'color: #475569' }, indent.replace(/\s\s/g, '│ ').replace(/│ $/, '└─')),
           h('span', { style: `color: ${opColor}; font-weight: bold` }, n.operation),
-          n.table ? h('span', { style: 'color: #94a3b8' }, ` on ${n.table}`) : null,
+          n.joinType ? h('span', { style: 'color: #fb923c' }, ` [${n.joinType}]`) : null,
+          n.table ? h('span', { style: n.invalid ? 'color: #ef4444; font-weight: bold' : 'color: #94a3b8' }, n.invalid ? ` on ${n.table}（表不存在）` : ` on ${n.table}`) : null,
           n.index ? h('span', { style: 'color: #eab308' }, ` [${n.index}]`) : null,
-          h('span', { style: 'color: #64748b' }, ` cost=${n.cost.toFixed(1)} rows=${n.rows}`),
+          n.filter ? h('span', { style: n.invalid ? 'color: #ef4444' : 'color: #f472b6' }, n.invalid && !n.filter ? ' ⚠ 缺少连接条件' : ` ON ${n.filter}`) : (n.operation.includes('Join') ? h('span', { style: 'color: #ef4444' }, ' ⚠ 缺少连接条件') : null),
+          h('span', { style: 'color: #64748b' }, ` cost=${Number(n.cost).toFixed(1)} rows=${n.rows}`),
         ]),
         ...(n.children || []).map((child: any) => h(PlanNode, { node: child, depth: (props.depth || 0) + 1 }))
       ])
@@ -107,57 +132,58 @@ function drawER() {
   const ctx = canvas.getContext('2d')
   if (!ctx) return
   const tables = store.parsed.tables
+  const knownTables = new Set(SCHEMA_TABLES.map(s => s.name))
   ctx.clearRect(0, 0, canvas.width, canvas.height)
   canvas.width = canvas.clientWidth
   canvas.height = 200
   const W = canvas.width, H = 200
-  const spacing = W / (tables.length + 1)
+  const spacing = W / Math.max(tables.length + 1, 2)
   const positions: Record<string, { x: number; y: number }> = {}
   tables.forEach((t, i) => { positions[t] = { x: spacing * (i + 1), y: H / 2 } })
 
-  // Draw joins
+  // Draw joins along the real join chain (j.from -> j.table)
   store.parsed.joins.forEach(j => {
-    const src = positions[tables[0]]
+    const src = positions[j.from || tables[0]]
     const dst = positions[j.table]
     if (!src || !dst) return
+    const bad = !j.valid
     ctx.beginPath()
     ctx.moveTo(src.x, src.y)
     ctx.lineTo(dst.x, dst.y)
-    ctx.strokeStyle = '#f97316'
+    ctx.strokeStyle = bad ? '#ef4444' : '#f97316'
     ctx.lineWidth = 2
-    ctx.setLineDash([4, 4])
+    ctx.setLineDash(bad ? [2, 3] : [4, 4])
     ctx.stroke()
     ctx.setLineDash([])
     const mx = (src.x + dst.x) / 2, my = (src.y + dst.y) / 2
-    ctx.fillStyle = '#f97316'
+    ctx.fillStyle = bad ? '#ef4444' : '#f97316'
     ctx.font = '10px monospace'
     ctx.textAlign = 'center'
-    ctx.fillText(j.type, mx, my - 5)
+    ctx.fillText(bad ? `${j.type} ⚠` : j.type, mx, my - 5)
   })
 
   // Draw table boxes
-  tables.forEach((t, i) => {
+  tables.forEach((t) => {
     const pos = positions[t]
     if (!pos) return
+    const known = knownTables.has(t)
     const x = pos.x, y = pos.y
     ctx.fillStyle = '#1e293b'
-    ctx.strokeStyle = '#3b82f6'
+    ctx.strokeStyle = known ? '#3b82f6' : '#ef4444'
     ctx.lineWidth = 2
     ctx.beginPath()
     ctx.roundRect(x - 50, y - 30, 100, 60, 6)
     ctx.fill()
     ctx.stroke()
-    ctx.fillStyle = '#06b6d4'
+    ctx.fillStyle = known ? '#06b6d4' : '#ef4444'
     ctx.font = 'bold 13px monospace'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    ctx.fillText(t, x, y - 10)
+    ctx.fillText(known ? t : `${t} ?`, x, y - 10)
     const schema = SCHEMA_TABLES.find(s => s.name === t)
-    if (schema) {
-      ctx.fillStyle = '#64748b'
-      ctx.font = '10px monospace'
-      ctx.fillText(schema.rowCount.toLocaleString() + ' rows', x, y + 10)
-    }
+    ctx.fillStyle = '#64748b'
+    ctx.font = '10px monospace'
+    ctx.fillText(schema ? schema.rowCount.toLocaleString() + ' rows' : 'unknown', x, y + 10)
   })
 }
 
