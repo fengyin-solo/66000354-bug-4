@@ -47,13 +47,19 @@
             <div class="bg-slate-900 rounded p-2 text-center"><div class="text-xs text-slate-500 mb-1">JOIN数</div><div class="text-orange-400 font-bold">{{ store.parsed.joins.length }}</div></div>
             <div class="bg-slate-900 rounded p-2 text-center"><div class="text-xs text-slate-500 mb-1">预估行数</div><div class="text-purple-400 font-bold">{{ store.parsed.estimatedCost }}</div></div>
           </div>
+          <div v-if="store.parsed.errors.length" class="space-y-1 mb-3">
+            <div class="text-xs text-red-400 mb-1">连接错误</div>
+            <div v-for="(msg, i) in store.parsed.errors" :key="'e' + i" class="text-xs flex items-start gap-2 bg-red-900/30 border border-red-700 rounded p-2">
+              <span class="text-red-400">✗</span><span class="text-red-300">{{ msg }}</span>
+            </div>
+          </div>
           <div v-if="store.parsed.suggestions.length" class="space-y-1">
             <div class="text-xs text-slate-500 mb-1">优化建议</div>
             <div v-for="(s, i) in store.parsed.suggestions" :key="i" class="text-xs flex items-start gap-2 bg-orange-900/30 border border-orange-700 rounded p-2">
               <span class="text-orange-400">⚠</span><span class="text-orange-300">{{ s }}</span>
             </div>
           </div>
-          <div v-else class="text-xs text-green-400 bg-green-900/20 border border-green-700 rounded p-2">✓ 未发现明显性能问题</div>
+          <div v-else-if="!store.parsed.errors.length" class="text-xs text-green-400 bg-green-900/20 border border-green-700 rounded p-2">✓ 未发现明显性能问题</div>
         </div>
         <div v-if="store.plan" class="bg-slate-800 rounded-lg p-4 border border-slate-700">
           <h3 class="text-sm font-bold text-slate-400 mb-3">执行计划树</h3>
@@ -86,15 +92,17 @@ const PlanNode = defineComponent({
       if (!props.node) return null
       const n = props.node as any
       const indent = '  '.repeat(props.depth || 0)
-      const opColor = n.operation.includes('Scan') ? '#22c55e' : n.operation.includes('Join') ? '#f97316' : n.operation.includes('Sort') ? '#8b5cf6' : '#06b6d4'
+      const opColor = n.operation.includes('Scan') ? '#22c55e' : n.operation.includes('Join') ? '#f97316' : n.operation.includes('Sort') ? '#8b5cf6' : n.operation === 'INVALID JOIN' ? '#ef4444' : '#06b6d4'
       return h('div', [
         h('div', { style: `padding-left: ${(props.depth || 0) * 20}px` }, [
           h('span', { style: 'color: #475569' }, indent.replace(/\s\s/g, '│ ').replace(/│ $/, '└─')),
-          h('span', { style: `color: ${opColor}; font-weight: bold` }, n.operation),
+          h('span', { style: `color: ${n.error ? '#ef4444' : opColor}; font-weight: bold` }, n.operation),
           n.table ? h('span', { style: 'color: #94a3b8' }, ` on ${n.table}`) : null,
           n.index ? h('span', { style: 'color: #eab308' }, ` [${n.index}]`) : null,
+          n.filter ? h('span', { style: 'color: #f97316' }, ` ON ${n.filter}`) : null,
           h('span', { style: 'color: #64748b' }, ` cost=${n.cost.toFixed(1)} rows=${n.rows}`),
         ]),
+        n.error ? h('div', { style: `padding-left: ${((props.depth || 0) + 1) * 20}px; color: #ef4444; font-size: 11px` }, `✗ ${n.error}`) : null,
         ...(n.children || []).map((child: any) => h(PlanNode, { node: child, depth: (props.depth || 0) + 1 }))
       ])
     }
@@ -106,7 +114,10 @@ function drawER() {
   if (!canvas || !store.parsed) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
-  const tables = store.parsed.tables
+  // 解析出的主表/连接表，加上连接段中引用了但不存在的表（错误连接也要呈现）
+  const known = store.parsed.tables
+  const missing = store.parsed.joins.filter(j => j.table !== '?' && !known.includes(j.table)).map(j => j.table)
+  const tables = [...known, ...missing]
   ctx.clearRect(0, 0, canvas.width, canvas.height)
   canvas.width = canvas.clientWidth
   canvas.height = 200
@@ -117,37 +128,38 @@ function drawER() {
 
   // Draw joins
   store.parsed.joins.forEach(j => {
-    const src = positions[tables[0]]
+    const src = positions[known[0]]
     const dst = positions[j.table]
     if (!src || !dst) return
     ctx.beginPath()
     ctx.moveTo(src.x, src.y)
     ctx.lineTo(dst.x, dst.y)
-    ctx.strokeStyle = '#f97316'
+    ctx.strokeStyle = j.error ? '#ef4444' : '#f97316'
     ctx.lineWidth = 2
     ctx.setLineDash([4, 4])
     ctx.stroke()
     ctx.setLineDash([])
     const mx = (src.x + dst.x) / 2, my = (src.y + dst.y) / 2
-    ctx.fillStyle = '#f97316'
+    ctx.fillStyle = j.error ? '#ef4444' : '#f97316'
     ctx.font = '10px monospace'
     ctx.textAlign = 'center'
-    ctx.fillText(j.type, mx, my - 5)
+    ctx.fillText(j.error ? `${j.type} ✗` : j.type, mx, my - 5)
   })
 
   // Draw table boxes
-  tables.forEach((t, i) => {
+  tables.forEach((t) => {
     const pos = positions[t]
     if (!pos) return
     const x = pos.x, y = pos.y
+    const exists = !!SCHEMA_TABLES.find(s => s.name === t)
     ctx.fillStyle = '#1e293b'
-    ctx.strokeStyle = '#3b82f6'
+    ctx.strokeStyle = exists ? '#3b82f6' : '#ef4444'
     ctx.lineWidth = 2
     ctx.beginPath()
     ctx.roundRect(x - 50, y - 30, 100, 60, 6)
     ctx.fill()
     ctx.stroke()
-    ctx.fillStyle = '#06b6d4'
+    ctx.fillStyle = exists ? '#06b6d4' : '#ef4444'
     ctx.font = 'bold 13px monospace'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
@@ -157,6 +169,10 @@ function drawER() {
       ctx.fillStyle = '#64748b'
       ctx.font = '10px monospace'
       ctx.fillText(schema.rowCount.toLocaleString() + ' rows', x, y + 10)
+    } else {
+      ctx.fillStyle = '#ef4444'
+      ctx.font = '10px monospace'
+      ctx.fillText('表不存在', x, y + 10)
     }
   })
 }
